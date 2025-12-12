@@ -36,6 +36,7 @@ export default function FormulaEditorDemo() {
   const editorRef = useRef<any>(null);
   const monacoRef = useRef<any>(null);
   const tokenDecosRef = useRef<string[]>([]);
+  const lookupTableRef = useRef<string>(lookupTable);
   const [selectedFunction, setSelectedFunction] = useState<string | null>(null);
   const [filterFnKeyword, setFilterFnKeyword] = useState<string>("");
   const [lastSelectedField, setLastSelectedField] = useState<{ field: string; displayName: string } | null>(null);
@@ -48,6 +49,10 @@ export default function FormulaEditorDemo() {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => {
+    lookupTableRef.current = lookupTable;
+  }, [lookupTable]);
 
   // 初始化编辑器：保存实例引用，注册补全/悬浮提示，并设置内联高亮
   const handleEditorDidMount = useCallback((editor: any, monaco: any) => {
@@ -63,6 +68,14 @@ export default function FormulaEditorDemo() {
           startColumn: word.startColumn,
           endColumn: word.endColumn,
         };
+        const line = model.getLineContent(position.lineNumber) || "";
+        const left = line.slice(0, Math.max(0, (position.column || 1) - 1));
+        const trimmedLeft = left.replace(/\s+/g, "");
+        const insideBracket = trimmedLeft.lastIndexOf("[") > trimmedLeft.lastIndexOf("]");
+        const afterAt = /@[^\.()]*$/.test(trimmedLeft) || trimmedLeft.endsWith("@");
+        const tableMatches = Array.from((trimmedLeft.matchAll(/\[([^\]]+)\]/g)) || []);
+        const recentTable = tableMatches.length ? String(tableMatches[tableMatches.length - 1][1]) : (lookupTableRef.current || (schema[0]?.name || ""));
+        const fieldsForTable = (schema.find((x) => x.name === recentTable)?.fields || []);
 
         const funcSuggestions = FUNCTIONS.map((f) => ({
           label: f.name,
@@ -73,15 +86,48 @@ export default function FormulaEditorDemo() {
           detail: "函数",
         }));
 
-        const fieldSuggestions = SAMPLE_FIELDS.map((f) => ({
-          label: `@${f.name}`,
-          kind: monaco.languages.CompletionItemKind.Field,
-          insertText: `@${f.name}`,
+        const tableSuggestions = schema.map((t) => ({
+          label: t.name,
+          kind: monaco.languages.CompletionItemKind.Module,
+          insertText: `[${t.name}].`,
           range,
-          detail: f.type,
+          detail: "数据表",
         }));
 
-        return { suggestions: [...funcSuggestions, ...fieldSuggestions] };
+        const openCount = (left.match(/\(/g) || []).length;
+        const closeCount = (left.match(/\)/g) || []).length;
+        const insideArgs = openCount > closeCount;
+        const prevChar = trimmedLeft.slice(-1);
+        const fieldSuggestionsCtx = fieldsForTable.map((f) => {
+          const hasPrefixDot = trimmedLeft.endsWith(`[${recentTable}].`);
+          const hasPrefixNoDot = trimmedLeft.endsWith(`[${recentTable}]`);
+          let token = '';
+          let needComma = insideArgs && prevChar !== '(' && prevChar !== ',';
+          if (hasPrefixDot) {
+            token = `@${f.name}`;
+            needComma = false;
+          } else if (hasPrefixNoDot) {
+            token = `.@${f.name}`;
+            needComma = false;
+          } else {
+            token = `[${recentTable}].@${f.name}`;
+          }
+          return {
+            label: `@${f.name}`,
+            kind: monaco.languages.CompletionItemKind.Field,
+            insertText: `${needComma ? ', ' : ''}${token}`,
+            range,
+            detail: `字段（${recentTable}）`,
+          };
+        });
+
+        if (insideBracket) {
+          return { suggestions: tableSuggestions };
+        }
+        if (afterAt || /\[([^\]]+)\]\.$/.test(trimmedLeft)) {
+          return { suggestions: fieldSuggestionsCtx };
+        }
+        return { suggestions: [...funcSuggestions, ...tableSuggestions, ...fieldSuggestionsCtx] };
       },
     });
 
@@ -705,6 +751,27 @@ export default function FormulaEditorDemo() {
         tableMatches.forEach((m: any) => { if (!inPair(m.range)) decos.push({ range: m.range, options: { inlineClassName: 'fe-token-table' } }); });
         fieldMatches.forEach((m: any) => { if (!inPair(m.range)) decos.push({ range: m.range, options: { inlineClassName: 'fe-token-field' } }); });
         tokenDecosRef.current = ed.deltaDecorations(tokenDecosRef.current, decos);
+        // 同步最近选择的表与字段，配合联想选择后更新侧栏
+        try {
+          const pos = ed.getPosition();
+          if (pos) {
+            const line = model.getLineContent(pos.lineNumber) || "";
+            const left = line.slice(0, Math.max(0, (pos.column || 1) - 1));
+            const trimmed = left.replace(/\s+/g, "");
+            const mTable = trimmed.match(/\[([^\]]+)\](?:\.)?$/);
+            if (mTable && mTable[1]) {
+              const tName = String(mTable[1]);
+              if (schema.some((x) => x.name === tName)) {
+                setLookupTable(tName);
+              }
+            }
+            const mField = trimmed.match(/@([^\.()\s,，\]]+)$/);
+            if (mField && mField[1]) {
+              const disp = String(mField[1]);
+              setLastSelectedField({ field: disp, displayName: disp });
+            }
+          }
+        } catch {}
       }
     } catch {}
     try {
