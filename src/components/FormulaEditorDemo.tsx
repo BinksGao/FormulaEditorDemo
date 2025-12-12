@@ -40,6 +40,8 @@ export default function FormulaEditorDemo() {
   const [selectedFunction, setSelectedFunction] = useState<string | null>(null);
   const [filterFnKeyword, setFilterFnKeyword] = useState<string>("");
   const [lastSelectedField, setLastSelectedField] = useState<{ field: string; displayName: string } | null>(null);
+  const [tableFilterKey, setTableFilterKey] = useState<string>("");
+  const [fieldFilterKey, setFieldFilterKey] = useState<string>("");
 
   useEffect(() => {
     hfRef.current = createHyperEngine();
@@ -59,7 +61,14 @@ export default function FormulaEditorDemo() {
     editorRef.current = editor;
     monacoRef.current = monaco;
 
+    try {
+      monaco.languages.setLanguageConfiguration('plaintext', {
+        wordPattern: /[^\s\[\]\(\),\.]+/,
+      });
+    } catch {}
+
     monaco.languages.registerCompletionItemProvider("plaintext", {
+      triggerCharacters: ['@', '[', '.'],
       provideCompletionItems: (model: any, position: any) => {
         const word = model.getWordUntilPosition(position);
         const range = {
@@ -68,15 +77,6 @@ export default function FormulaEditorDemo() {
           startColumn: word.startColumn,
           endColumn: word.endColumn,
         };
-        const line = model.getLineContent(position.lineNumber) || "";
-        const left = line.slice(0, Math.max(0, (position.column || 1) - 1));
-        const trimmedLeft = left.replace(/\s+/g, "");
-        const insideBracket = trimmedLeft.lastIndexOf("[") > trimmedLeft.lastIndexOf("]");
-        const afterAt = /@[^\.()]*$/.test(trimmedLeft) || trimmedLeft.endsWith("@");
-        const tableMatches = Array.from((trimmedLeft.matchAll(/\[([^\]]+)\]/g)) || []);
-        const recentTable = tableMatches.length ? String(tableMatches[tableMatches.length - 1][1]) : (lookupTableRef.current || (schema[0]?.name || ""));
-        const fieldsForTable = (schema.find((x) => x.name === recentTable)?.fields || []);
-
         const funcSuggestions = FUNCTIONS.map((f) => ({
           label: f.name,
           kind: monaco.languages.CompletionItemKind.Function,
@@ -85,49 +85,7 @@ export default function FormulaEditorDemo() {
           range,
           detail: "函数",
         }));
-
-        const tableSuggestions = schema.map((t) => ({
-          label: t.name,
-          kind: monaco.languages.CompletionItemKind.Module,
-          insertText: `[${t.name}].`,
-          range,
-          detail: "数据表",
-        }));
-
-        const openCount = (left.match(/\(/g) || []).length;
-        const closeCount = (left.match(/\)/g) || []).length;
-        const insideArgs = openCount > closeCount;
-        const prevChar = trimmedLeft.slice(-1);
-        const fieldSuggestionsCtx = fieldsForTable.map((f) => {
-          const hasPrefixDot = trimmedLeft.endsWith(`[${recentTable}].`);
-          const hasPrefixNoDot = trimmedLeft.endsWith(`[${recentTable}]`);
-          let token = '';
-          let needComma = insideArgs && prevChar !== '(' && prevChar !== ',';
-          if (hasPrefixDot) {
-            token = `@${f.name}`;
-            needComma = false;
-          } else if (hasPrefixNoDot) {
-            token = `.@${f.name}`;
-            needComma = false;
-          } else {
-            token = `[${recentTable}].@${f.name}`;
-          }
-          return {
-            label: `@${f.name}`,
-            kind: monaco.languages.CompletionItemKind.Field,
-            insertText: `${needComma ? ', ' : ''}${token}`,
-            range,
-            detail: `字段（${recentTable}）`,
-          };
-        });
-
-        if (insideBracket) {
-          return { suggestions: tableSuggestions };
-        }
-        if (afterAt || /\[([^\]]+)\]\.$/.test(trimmedLeft)) {
-          return { suggestions: fieldSuggestionsCtx };
-        }
-        return { suggestions: [...funcSuggestions, ...tableSuggestions, ...fieldSuggestionsCtx] };
+        return { suggestions: funcSuggestions };
       },
     });
 
@@ -645,6 +603,26 @@ export default function FormulaEditorDemo() {
         const closeCount = (left.match(/\)/g) || []).length;
         const insideArgs = openCount > closeCount;
         const prevChar = trimmedLeft.slice(-1);
+        // 若用户已输入用于过滤的字段关键字，先清除该关键字
+        let startColumn = (pos.column || 1);
+        let cleared = false;
+        const mFieldToken = left.match(/@([^.()\s,，\]]*)$/);
+        if (mFieldToken && typeof mFieldToken[1] === 'string') {
+          const tok = '@' + String(mFieldToken[1]);
+          startColumn = (pos.column || 1) - tok.length;
+          const range = { startLineNumber: pos.lineNumber, startColumn, endLineNumber: pos.lineNumber, endColumn: (pos.column || 1) };
+          editor.executeEdits('fe-field', [{ range, text: '' }]);
+          cleared = true;
+        } else {
+          const mPlain = left.match(/([^\s\[\]\(\),\.]+)$/);
+          if (mPlain && mPlain[0]) {
+            const tok = String(mPlain[0]);
+            startColumn = (pos.column || 1) - tok.length;
+            const range = { startLineNumber: pos.lineNumber, startColumn, endLineNumber: pos.lineNumber, endColumn: (pos.column || 1) };
+            editor.executeEdits('fe-field', [{ range, text: '' }]);
+            cleared = true;
+          }
+        }
         let token = "";
         let needComma = insideArgs && prevChar !== '(' && prevChar !== ',';
         if (lookupTable) {
@@ -662,7 +640,13 @@ export default function FormulaEditorDemo() {
         } else {
           token = `@${displayName}`;
         }
-        insertAtCursor(`${needComma ? ', ' : ''}${token}`);
+        const toInsert = `${needComma ? ', ' : ''}${token}`;
+        if (cleared) {
+          const rangeInsert = { startLineNumber: pos.lineNumber, startColumn, endLineNumber: pos.lineNumber, endColumn: startColumn };
+          editor.executeEdits('fe-field', [{ range: rangeInsert, text: toInsert }]);
+        } else {
+          insertAtCursor(toInsert);
+        }
       } catch {
         const token = lookupTable ? `[${lookupTable}].@${displayName}` : `@${displayName}`;
         insertAtCursor(token);
@@ -694,8 +678,32 @@ export default function FormulaEditorDemo() {
         const needComma = insideArgs && prevChar !== '(' && prevChar !== ',';
         const prefix = `[${name}].`;
         const already = trimmedLeft.endsWith(prefix);
-        const insertText = `${(!already && needComma) ? ', ' : ''}${already ? '' : prefix}`;
-        if (insertText) insertAtCursor(insertText);
+        // 若左侧为未闭合的 '[' 内容或普通最后 token（用于过滤），则先清除该片段再插入前缀
+        const idxOpen = left.lastIndexOf('[');
+        const idxClose = left.lastIndexOf(']');
+        let replaced = false;
+        let startColumn = (pos.column || 1);
+        if (idxOpen > idxClose) {
+          const kw = left.slice(idxOpen + 1);
+          startColumn = idxOpen + 2; // 1-based 列 + 跳过 '['
+          const range = { startLineNumber: pos.lineNumber, startColumn, endLineNumber: pos.lineNumber, endColumn: (pos.column || 1) };
+          const text = `${kw ? '' : ''}${prefix}`;
+          editor.executeEdits('fe-table', [{ range, text }]);
+          replaced = true;
+        } else {
+          const mTok = left.match(/([^\s\[\]\(\),\.]+)$/);
+          if (mTok && mTok[0]) {
+            const tok = String(mTok[0]);
+            startColumn = (pos.column || 1) - tok.length;
+            const range = { startLineNumber: pos.lineNumber, startColumn, endLineNumber: pos.lineNumber, endColumn: (pos.column || 1) };
+            editor.executeEdits('fe-table', [{ range, text: prefix }]);
+            replaced = true;
+          }
+        }
+        if (!replaced) {
+          const insertText = `${(!already && needComma) ? ', ' : ''}${already ? '' : prefix}`;
+          if (insertText) insertAtCursor(insertText);
+        }
       } else {
         insertAtCursor(`[${name}].`);
       }
@@ -769,6 +777,25 @@ export default function FormulaEditorDemo() {
             if (mField && mField[1]) {
               const disp = String(mField[1]);
               setLastSelectedField({ field: disp, displayName: disp });
+              setSelectedFunction('FILTER');
+            }
+            // 动态过滤关键字：编辑器中输入的表名/字段名用于侧栏过滤
+            const idxOpen = left.lastIndexOf('[');
+            const idxClose = left.lastIndexOf(']');
+            const afterAtCtx = /@[^.()\s,，\]]*$/.test(left) || trimmed.endsWith('@');
+            if (idxOpen > idxClose) {
+              const kw = left.slice(idxOpen + 1).trim();
+              setTableFilterKey(kw);
+            } else {
+              const lastTok = left.match(/([^\s\[\]\(\),\.]+)$/);
+              if (!afterAtCtx && lastTok && lastTok[1]) setTableFilterKey(String(lastTok[1]).trim());
+              else setTableFilterKey("");
+            }
+            const mFieldPlain = left.match(/@([^.()\s,，\]]*)$/) || left.match(/([^\s\[\]\(\),\.]+)$/);
+            if (mFieldPlain && mFieldPlain[1]) {
+              setFieldFilterKey(String(mFieldPlain[1]).trim());
+            } else {
+              setFieldFilterKey("");
             }
           }
         } catch {}
@@ -861,7 +888,7 @@ export default function FormulaEditorDemo() {
               value={editorFormula}
               onMount={(editor, monaco) => handleEditorDidMount(editor, monaco)}
               onChange={onEditorChange}
-              options={{ minimap: { enabled: false }, fontSize: 14 }}
+              options={{ minimap: { enabled: false }, fontSize: 14, quickSuggestions: { other: true, comments: true, strings: true }, suggestOnTriggerCharacters: true }}
               className="fe-editor"
             />
           </div>
@@ -887,22 +914,26 @@ export default function FormulaEditorDemo() {
                   <div className="fe-group">
                     <div className="fe-hint fe-mb6">字段引用</div>
                     <div className="fe-function-list">
-                      {getFieldsForTable(lookupTable).map((f) => (
-                        <button key={f.field} onClick={() => insertCurrentField(f.name)} className="fe-function-item">
-                          @{f.name}
-                        </button>
-                      ))}
+                      {getFieldsForTable(lookupTable)
+                        .filter((f) => !fieldFilterKey || ((f.name || '').toLowerCase().includes(fieldFilterKey.toLowerCase())))
+                        .map((f) => (
+                          <button key={f.field} onClick={() => insertCurrentField(f.name)} className="fe-function-item">
+                            @{f.name}
+                          </button>
+                        ))}
                     </div>
                   </div>
                   <div className="fe-group">
                     <div className="fe-hint fe-mb6">整表引用</div>
                     <div className="fe-function-list">
-                      {!tableListHidden &&
-                        schema.map((t) => (
-                          <button key={t.name} onClick={() => chooseTable(t.name)} className={`fe-function-item ${lookupTable === t.name ? "active" : ""}`}>
-                            {t.name}
-                          </button>
-                        ))}
+                        {!tableListHidden &&
+                          schema
+                            .filter((t) => !tableFilterKey || t.name.toLowerCase().includes(tableFilterKey.toLowerCase()))
+                            .map((t) => (
+                              <button key={t.name} onClick={() => chooseTable(t.name)} className={`fe-function-item ${lookupTable === t.name ? "active" : ""}`}>
+                                {t.name}
+                              </button>
+                            ))}
                     </div>
                   </div>
                   <div className="fe-group">
