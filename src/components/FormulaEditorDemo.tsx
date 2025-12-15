@@ -4,35 +4,23 @@ import Editor from "@monaco-editor/react";
 import { createHyperEngine, computeFormula, parseFormula } from "../lib/formulaEngine";
 import "./formula-editor.css";
 import {
-  SAMPLE_FIELDS,
   FUNCTIONS,
   FUNCTION_DOCS,
   FUNCTION_GROUPS,
   SAMPLE_SCHEMA,
-  buildLookupIndexMatch,
-  colLetter,
   normalizeFormula,
 } from "../utils/formulaUtils";
 
 export default function FormulaEditorDemo() {
-  const [inputText, setInputText] = useState("");
-  const [detectedIntent, setDetectedIntent] = useState<string | null>(null);
-  const [generatedFormula, setGeneratedFormula] = useState("");
   const [editorFormula, setEditorFormula] = useState("");
   const hfRef = useRef<any | null>(null);
   const [preview, setPreview] = useState<string | number | null>(null);
   const [activeTab, setActiveTab] = useState<"edit" | "ai">("edit");
-  const [fields] = useState(SAMPLE_FIELDS);
   const [schema] = useState(SAMPLE_SCHEMA);
   const [lookupTable, setLookupTable] = useState<string>(SAMPLE_SCHEMA[0]?.name || "");
   const getFieldsForTable = useCallback((t: string) => schema.find((x) => x.name === t)?.fields || [], [schema]);
-  const [lookupKeyField, setLookupKeyField] = useState<string>(getFieldsForTable(lookupTable)[0]?.field || "");
-  const [lookupValueField, setLookupValueField] = useState<string>(getFieldsForTable(lookupTable)[1]?.field || "");
   const [tableListHidden, setTableListHidden] = useState<boolean>(false);
   const [validationError, setValidationError] = useState<string>("");
-  const [lookupKeyExpr, setLookupKeyExpr] = useState<string>("@字段1");
-  const [wrapIfna, setWrapIfna] = useState<boolean>(true);
-  const [ifnaDefault, setIfnaDefault] = useState<string>('"未找到"');
   const editorRef = useRef<any>(null);
   const monacoRef = useRef<any>(null);
   const tokenDecosRef = useRef<string[]>([]);
@@ -46,7 +34,6 @@ export default function FormulaEditorDemo() {
   const suppressFilterOnceRef = useRef<boolean>(false);
   const suppressFilterUntilRef = useRef<number>(0);
   const keepArgPickerUntilRef = useRef<number>(0);
-  const prevLeftRef = useRef<string>("");
 
   useEffect(() => {
     hfRef.current = createHyperEngine();
@@ -61,7 +48,15 @@ export default function FormulaEditorDemo() {
     lookupTableRef.current = lookupTable;
   }, [lookupTable]);
 
-  // 初始化编辑器：保存实例引用，注册补全/悬浮提示，并设置内联高亮
+  /**
+   * 初始化编辑器
+   *
+   * 参数：
+   * - editor：Monaco 编辑器实例
+   * - monaco：Monaco 命名空间对象
+   *
+   * 功能：保存实例引用、注册补全与悬浮提示、安装按键/光标监听，并进行内联高亮
+   */
   const handleEditorDidMount = useCallback((editor: any, monaco: any) => {
     editorRef.current = editor;
     monacoRef.current = monaco;
@@ -112,6 +107,20 @@ export default function FormulaEditorDemo() {
 
     try {
       editor.onKeyDown((e: any) => {
+        if (e?.browserEvent?.key === '，') {
+          try {
+            const pos = editor.getPosition();
+            const model = editor.getModel();
+            const sel = editor.getSelection();
+            const range = sel && sel.isEmpty()
+              ? { startLineNumber: pos.lineNumber, startColumn: (pos.column || 1), endLineNumber: pos.lineNumber, endColumn: (pos.column || 1) } as any
+              : sel;
+            editor.executeEdits('fe-comma-cnv', [{ range, text: ',', forceMoveMarkers: true }]);
+            e.preventDefault();
+            e.stopPropagation();
+          } catch {}
+          return;
+        }
         if (e.keyCode === monaco.KeyCode.Backspace) {
           try {
             const pos = editor.getPosition();
@@ -216,8 +225,15 @@ export default function FormulaEditorDemo() {
     highlightEditorTokens();
   }, []);
 
-  // --- helper: set Monaco markers ---
-  // 解析错误标记：将语法错误映射为 Monaco 的 markers，便于定位
+  /**
+   * 设置解析错误标记
+   *
+   * 参数：
+   * - errors：解析错误数组，包含 message、位置等
+   * - originalText：原始编辑器文本
+   *
+   * 功能：将解析错误映射为 Monaco 的 markers，便于在编辑器中定位问题
+   */
   const setEditorMarkersFromErrors = (errors: Array<{ message: string; location?: number; start?: number; end?: number }>, originalText: string) => {
     try {
       if (!monacoRef.current || !editorRef.current) return;
@@ -264,8 +280,14 @@ export default function FormulaEditorDemo() {
     }
   };
 
-  // validate + preview（核心）
-  // 校验与预览：将自定义公式标准化，交给 HyperFormula 进行解析与计算
+  /**
+   * 校验并预览公式（核心）
+   *
+   * 参数：
+   * - raw：用户输入的原始公式字符串（不一定带开头的 =）
+   *
+   * 功能：标准化自定义语法，调用引擎解析与计算，设置错误标记与预览结果
+   */
   const validateAndPreview = async (raw: string) => {
     setValidationError("");
     setPreview(null);
@@ -314,8 +336,11 @@ export default function FormulaEditorDemo() {
     setPreview(res.value ?? null);
   };
 
-  // --- existing helpers (保留你原有逻辑) ---
-  // 函数签名缓存：统计各内置函数的必选/可选/可变参数，用于静态校验
+  /**
+   * 函数签名缓存
+   *
+   * 功能：统计内置函数的必选/可选/可变参数数量，用于静态校验
+   */
   const fnSigMap = React.useMemo(() => {
     const map: Record<string, { required: number; optional: number; variadic: boolean }> = {};
     FUNCTIONS.forEach((f) => {
@@ -342,6 +367,15 @@ export default function FormulaEditorDemo() {
     return map;
   }, []);
 
+  /**
+   * 提取函数调用
+   *
+   * 参数：
+   * - expr：公式表达式（不带开头的 =）
+   *
+   * 返回：
+   * - { name, args } 列表，表示函数名与其参数数组
+   */
   const extractCalls = (expr: string) => {
     const calls: Array<{ name: string; args: string[] }> = [];
     const s = expr || "";
@@ -391,6 +425,15 @@ export default function FormulaEditorDemo() {
     return calls;
   };
 
+  /**
+   * 静态参数校验
+   *
+   * 参数：
+   * - code：用户输入的公式文本
+   *
+   * 返回：
+   * - 错误消息字符串；无错误返回空字符串
+   */
   const staticValidate = (code: string) => {
     const normalizedNoEq = normalizeFormula(code, schema, lookupTable);
     const outer = normalizedNoEq.startsWith("=") ? normalizedNoEq.slice(1) : normalizedNoEq;
@@ -408,6 +451,14 @@ export default function FormulaEditorDemo() {
     return "";
   };
 
+  /**
+   * 更新预览值
+   *
+   * 参数：
+   * - formula：当前公式文本
+   *
+   * 功能：标准化后进行一次快速计算，显示即时预览
+   */
   const updatePreview = async (formula: string) => {
     try {
       const hf = hfRef.current;
@@ -425,9 +476,14 @@ export default function FormulaEditorDemo() {
     }
   };
 
-  // 转换显示名到代码名：
-  // - [表].@字段 或 @字段/裸字段 根据上下文转换为 [tableFieldName.field]
-  // - 表显示名映射为 schema.fieldName；字段显示名映射为 schema.fields[].field
+  /**
+   * 显示名转换为代码名
+   *
+   * 参数：
+   * - code：用户输入的公式文本
+   *
+   * 功能：将 [表].@字段 / @字段 / 裸字段 转换为 [表代码名.字段代码名]
+   */
   const transformToFieldKeys = (code: string) => {
     const getFieldKey = (table: string, disp: string) => {
       const t = schema.find((x) => x.name.toLowerCase() === table.toLowerCase());
@@ -535,7 +591,11 @@ export default function FormulaEditorDemo() {
     return out;
   };
 
-  // 确认按钮行为：仅输出转换后的公式字符串到控制台
+  /**
+   * 确认按钮行为
+   *
+   * 功能：将编辑器中的公式做显示名到代码名的转换，并移除空格后输出
+   */
   const validateFormula = () => {
     const code = (editorFormula || "").trim();
     const transformed = transformToFieldKeys(code);
@@ -543,102 +603,16 @@ export default function FormulaEditorDemo() {
     console.log(noSpaces);
   };
 
-  const FORMULA_TEMPLATES: Record<string, string> = {
-    text_concat: "=CONCAT({field1}, {field2})",
-    date_compare: "=IF({left} {operator} {right}, TRUE, FALSE)",
-    add_fields: "={left} + {right}",
-    order_timeout: '=IF(DATEDIF({order_date}, TODAY(), "H")>24, "超时", "正常")',
-  };
+  
 
-  // 简易意图识别：根据文本关键词匹配示例模板
-  const detectIntent = (s: string) => {
-    const t = s.toLowerCase();
-    if (t.includes("拼接") || t.includes("合并") || t.includes("连接")) return "text_concat";
-    if (t.includes("判断") && (t.includes("早于") || t.includes("晚于") || t.includes("大于") || t.includes("小于"))) return "date_compare";
-    if (t.includes("相加") || t.includes("加上") || t.includes("求和")) return "add_fields";
-    if (t.includes("超时") || t.includes("24小时") || t.includes("未发货")) return "order_timeout";
-    return "unknown";
-  };
-
-  // 示例参数提取：从自然语言中提取字段占位符
-  const extractParams = (s: string) => {
-    const result: any = {};
-    if (s.includes("今天") || s.includes("当前日期")) {
-      result.left = "TODAY()";
-      result.right = "TODAY()";
-    }
-    if (s.includes("早于")) result.operator = "<";
-    if (s.includes("晚于")) result.operator = ">";
-    SAMPLE_FIELDS.forEach((f) => {
-      if (s.includes(f.name)) {
-        if (!result.field1) result.field1 = `@${f.name}`;
-        else if (!result.field2) result.field2 = `@${f.name}`;
-      }
-    });
-    if (s.includes("下单时间") || s.includes("订单时间")) {
-      result.order_date = "[下单时间]";
-    }
-    return result;
-  };
-
-  // 模板填充：将识别出的意图与参数替换为公式示例
-  const fillTemplate = (intent: string, params: Record<string, string>) => {
-    const template = FORMULA_TEMPLATES[intent];
-    if (!template) return "";
-    let formula = template;
-    Object.keys(params).forEach((k) => {
-      const re = new RegExp(`\\{${k}\\}`, "g");
-      formula = formula.replace(re, params[k]);
-    });
-    formula = formula.replace(/\{field1\}/g, params.field1 || "@字段1");
-    formula = formula.replace(/\{field2\}/g, params.field2 || "@字段2");
-    formula = formula.replace(/\{left\}/g, params.left || "@左字段");
-    formula = formula.replace(/\{right\}/g, params.right || "@右字段");
-    formula = formula.replace(/\{operator\}/g, params.operator || "=");
-    return formula;
-  };
-
-  // 生成示例公式：结合意图识别与参数抽取得到示例公式
-  const generateFormulaByRules = () => {
-    const intent = detectIntent(inputText);
-    setDetectedIntent(intent);
-    const params = extractParams(inputText);
-    const formula = fillTemplate(intent, params);
-    setGeneratedFormula(formula);
-  };
-
-  // 插入文本：将字符串写入当前选区并聚焦编辑器
-  const insertTextToEditor = (text: string) => {
-    suppressFilterOnceRef.current = true;
-    suppressFilterUntilRef.current = Date.now() + 300;
-    if (!editorRef.current) return;
-    const editor = editorRef.current;
-    const sel = editor.getSelection();
-    const displayText = text.startsWith("=") ? text.slice(1) : text;
-    editor.executeEdits("insert-text", [{ range: sel, text: displayText, forceMoveMarkers: true }]);
-    editor.focus();
-  };
-
-  // 采纳示例：将右侧生成的公式写入编辑器
-  const insertFormulaToEditor = () => {
-    if (!generatedFormula) return;
-    suppressFilterOnceRef.current = true;
-    suppressFilterUntilRef.current = Date.now() + 2000;
-    insertTextToEditor(generatedFormula);
-  };
-
-  const copyToClipboard = async () => {
-    try {
-      await navigator.clipboard.writeText(generatedFormula);
-    } catch (e) {}
-  };
-
-  // 示例填充：快速将推荐指令写入输入框
-  const setExample = (t: string) => {
-    setInputText(t);
-  };
-
-  // 插入函数：与最近选择的字段联动，避免重复的 '.'，并将光标定位到括号内
+  /**
+   * 插入函数
+   *
+   * 参数：
+   * - name：函数名
+   *
+   * 功能：依据最近选择的字段智能拼接方法调用，并将光标定位到括号内
+   */
   const insertFunctionToEditor = (name: string) => {
     suppressFilterOnceRef.current = true;
     suppressFilterUntilRef.current = Date.now() + 2000;
@@ -680,19 +654,20 @@ export default function FormulaEditorDemo() {
     setTableListHidden(false);
   };
 
-  // 插入字段：在参数上下文中智能补逗号；若左侧已有 [表]. 或 [表] 前缀则直接拼接
+  /**
+   * 插入字段
+   *
+   * 参数：
+   * - displayName：字段显示名
+   *
+   * 功能：在参数上下文中智能补逗号，并避免重复表前缀；若已存在尾部结构则仅替换字段
+   */
   const insertCurrentField = (displayName: string) => {
-    // 旧参数：字段标识 name
-    // 新参数：显示名 displayName
     setLastSelectedField({ field: displayName, displayName });
     suppressFilterOnceRef.current = true;
     suppressFilterUntilRef.current = Date.now() + 2000;
     setFieldFilterKey("");
     setTableFilterKey("");
-    // 旧逻辑：在未选择数据表时也带出数据表前缀
-    // const effectiveTable = lookupTable || (schema[0]?.name || "");
-    // const prefix = effectiveTable ? `[${effectiveTable}].` : "";
-    // insertAtCursor(`${prefix}@${displayName}`);
     const editor = editorRef.current;
     if (editor) {
       try {
@@ -726,7 +701,7 @@ export default function FormulaEditorDemo() {
           }
         }
         let token = "";
-        let needComma = insideArgs && prevChar !== '(' && prevChar !== ',';
+        let needComma = insideArgs && prevChar !== '(' && prevChar !== ',' && prevChar !== '，';
         // 若左侧已存在 [表].@已有字段 的尾部结构，且表名与当前选中表一致：
         // - 同字段重复点击：不再追加，直接将光标定位到尾部
         // - 不同字段：仅替换 @字段 部分，避免重复 [表]. 前缀
@@ -805,7 +780,14 @@ export default function FormulaEditorDemo() {
     }
   };
 
-  // 选择数据表：插入 [表]. 前缀（不自动加逗号），并更新当前选中表
+  /**
+   * 选择数据表
+   *
+   * 参数：
+   * - name：数据表显示名
+   *
+   * 功能：插入 `[表].` 前缀并更新当前选中表，参数上下文中等待逗号后再显示列表
+   */
   const chooseTable = (name: string) => {
     try {
       suppressFilterOnceRef.current = true;
@@ -824,7 +806,7 @@ export default function FormulaEditorDemo() {
         const closeCount = (left.match(/\)/g) || []).length;
         const insideArgs = openCount > closeCount;
         const prevChar = trimmedLeft.slice(-1);
-        const needComma = insideArgs && prevChar !== '(' && prevChar !== ',';
+        const needComma = insideArgs && prevChar !== '(' && prevChar !== ',' && prevChar !== '，';
         const prefix = `[${name}].`;
         const already = trimmedLeft.endsWith(prefix);
         // 若左侧为未闭合的 '[' 内容或普通最后 token（用于过滤），则先清除该片段再插入前缀
@@ -882,35 +864,16 @@ export default function FormulaEditorDemo() {
     } catch {}
   };
 
-  useEffect(() => {
-    const fs = getFieldsForTable(lookupTable);
-    if (!lookupTable || fs.length === 0) {
-      setLookupKeyField("");
-      setLookupValueField("");
-    } else {
-      setLookupKeyField(fs[0]?.field || "");
-      setLookupValueField(fs[1]?.field || "");
-    }
-  }, [lookupTable, getFieldsForTable]);
+  
 
-  // 交叉查找示例：组合 IFNA 包裹的查找表达式
-  const composeCrossLookup = () => {
-    const fs = getFieldsForTable(lookupTable);
-    const base = buildLookupIndexMatch(lookupTable, fs, lookupKeyField, lookupKeyExpr, lookupValueField);
-    if (!base) return;
-    const f = wrapIfna ? `=IFNA(${base.slice(1)}, ${ifnaDefault})` : base;
-    const existing = (generatedFormula || "").trim();
-    let next = f;
-    if (existing) {
-      const eBody = existing.startsWith("=") ? existing.slice(1) : existing;
-      const fBody = f.startsWith("=") ? f.slice(1) : f;
-      next = `=CONCAT(${eBody}, ${fBody})`;
-    }
-    setGeneratedFormula(next);
-    setActiveTab("ai");
-  };
-
-  // 编辑器变更：更新公式、预览、样式装饰与当前函数选择，并进行解析校验
+  /**
+   * 编辑器变更回调
+   *
+   * 参数：
+   * - val：编辑器当前文本
+   *
+   * 功能：更新公式、预览、高亮与过滤关键字，并按上下文控制列表显隐
+   */
   const onEditorChange = (val: string | undefined) => {
     const raw = val || "";
     const v = raw.startsWith("=") ? raw.slice(1) : raw;
@@ -996,6 +959,7 @@ export default function FormulaEditorDemo() {
             if (insideArgsGlobal) {
               const leftNoTrailWS = left.replace(/\s+$/, '');
               const lastNs = leftNoTrailWS.slice(-1);
+              const lastComma = lastNs === '，' ? ',' : lastNs;
               const col0 = (pos.column || 1) - 1;
               const right = line.slice(Math.max(0, col0));
               const idxOpen = left.lastIndexOf('(');
@@ -1003,7 +967,7 @@ export default function FormulaEditorDemo() {
               const idxClose = idxCloseRel >= 0 ? col0 + idxCloseRel : -1;
               const innerSeg = (idxOpen >= 0 && idxClose >= 0) ? line.slice(idxOpen + 1, idxClose) : '';
               const innerHasContent = innerSeg.trim().length > 0;
-              if (lastNs === ',') {
+              if (lastComma === ',') {
                 keepArgPickerUntilRef.current = Date.now() + 1500;
                 setFieldListHidden(false);
                 setTableListHidden(false);
@@ -1075,16 +1039,15 @@ export default function FormulaEditorDemo() {
     // 关键：进行严格 parse 校验并设置 Monaco markers & preview
     validateAndPreview(v);
     if (suppressFilterOnceRef.current) suppressFilterOnceRef.current = false;
-    try {
-      const ed2 = editorRef.current;
-      const model2 = ed2?.getModel();
-      const pos2 = ed2?.getPosition();
-      const leftSnap = (model2?.getLineContent(pos2?.lineNumber || 1) || "").slice(0, Math.max(0, ((pos2?.column || 1) - 1)));
-      prevLeftRef.current = leftSnap;
-    } catch {}
   };
 
-  // 光标插入：在当前光标写入文本，并支持将光标移动到括号内部
+  /**
+   * 光标处插入文本
+   *
+   * 参数：
+   * - text：要插入的文本
+   * - caretOffset：插入后光标相对移动的偏移量（默认移到文本末尾）
+   */
   const insertAtCursor = (text: string, caretOffset?: number) => {
     if (!editorRef.current) return;
     const editor = editorRef.current;
@@ -1099,6 +1062,12 @@ export default function FormulaEditorDemo() {
     editor.focus();
   };
 
+  /**
+   * 获取函数分组（按关键字过滤）
+   *
+   * 返回：
+   * - 过滤后的函数分组列表
+   */
   const getFilteredGroups = () => {
     const kw = filterFnKeyword.trim().toUpperCase();
     if (!kw) return FUNCTION_GROUPS;
