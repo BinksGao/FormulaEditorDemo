@@ -42,6 +42,11 @@ export default function FormulaEditorDemo() {
   const [lastSelectedField, setLastSelectedField] = useState<{ field: string; displayName: string } | null>(null);
   const [tableFilterKey, setTableFilterKey] = useState<string>("");
   const [fieldFilterKey, setFieldFilterKey] = useState<string>("");
+  const [fieldListHidden, setFieldListHidden] = useState<boolean>(false);
+  const suppressFilterOnceRef = useRef<boolean>(false);
+  const suppressFilterUntilRef = useRef<number>(0);
+  const keepArgPickerUntilRef = useRef<number>(0);
+  const prevLeftRef = useRef<string>("");
 
   useEffect(() => {
     hfRef.current = createHyperEngine();
@@ -104,6 +109,90 @@ export default function FormulaEditorDemo() {
         return null;
       },
     });
+
+    try {
+      editor.onKeyDown((e: any) => {
+        if (e.keyCode === monaco.KeyCode.Backspace) {
+          try {
+            const pos = editor.getPosition();
+            const model = editor.getModel();
+            const line = model?.getLineContent(pos.lineNumber) || "";
+            const left = line.slice(0, Math.max(0, (pos.column || 1) - 1));
+            const m = left.match(/\[\s*[^\]]+\s*\]\s*\.\s*@[^\s\.,\)\]]+$/) || left.match(/@[^\s\.,\)\]]+$/);
+            if (m && m[0]) {
+              const token = String(m[0]);
+              const startIdx = left.lastIndexOf(token);
+              if (startIdx >= 0) {
+                const startCol = startIdx + 1;
+                const endCol = (pos.column || 1);
+                const range = { startLineNumber: pos.lineNumber, startColumn: startCol, endLineNumber: pos.lineNumber, endColumn: endCol } as any;
+                editor.executeEdits('fe-del-token', [{ range, text: '' }]);
+                e.preventDefault();
+                e.stopPropagation();
+                try {
+                  const pos2 = editor.getPosition();
+                  const model2 = editor.getModel();
+                  const fullLine = model2?.getLineContent(pos2.lineNumber) || "";
+                  const col2 = pos2.column || 1;
+                  const left2 = fullLine.slice(0, Math.max(0, col2 - 1));
+                  const right2 = fullLine.slice(Math.max(0, col2 - 1));
+                  const iOpen = left2.lastIndexOf('(');
+                  const iCloseRel = right2.indexOf(')');
+                  if (iOpen >= 0 && iCloseRel >= 0) {
+                    const iClose = (col2 - 1) + iCloseRel;
+                    const inner = fullLine.slice(iOpen + 1, iClose).trim();
+                    if (!inner) {
+                      setFieldListHidden(false);
+                      setTableListHidden(false);
+                      keepArgPickerUntilRef.current = Date.now() + 2000;
+                      setFieldFilterKey("");
+                      setTableFilterKey("");
+                    }
+                  }
+                } catch {}
+              }
+            }
+          } catch {}
+        }
+      });
+    } catch {}
+
+    try {
+      editor.onDidChangeCursorPosition(() => {
+        const pos = editor.getPosition();
+        const model = editor.getModel();
+        const line = model?.getLineContent(pos.lineNumber) || "";
+        const col = pos.column || 1;
+        const matches = Array.from(line.matchAll(/(cond\d+|value\d+)/ig));
+        if (!matches.length) return;
+        // 计算从光标到最近的分隔符（逗号或右括号）的边界
+        const fromIdx = Math.max(0, col - 1);
+        const nextCommaIdx = line.indexOf(',', fromIdx);
+        const nextParenIdx = line.indexOf(')', fromIdx);
+        const hasComma = nextCommaIdx !== -1;
+        const hasParen = nextParenIdx !== -1;
+        const boundaryIdx = Math.min(
+          hasComma ? nextCommaIdx : Infinity,
+          hasParen ? nextParenIdx : Infinity
+        );
+        for (const m of matches) {
+          const start = ((m as RegExpMatchArray).index || 0) + 1;
+          const end = start + m[0].length;
+          // 光标在占位符内部 → 清除当前占位符
+          if (col >= start && col <= end) {
+            const range = { startLineNumber: pos.lineNumber, startColumn: start, endLineNumber: pos.lineNumber, endColumn: end } as any;
+            editor.executeEdits('fe-clear-ph', [{ range, text: '' }]);
+            return;
+          }
+          // 光标在占位符之前，且占位符位于最近分隔符之前 → 清除该占位符
+          if (col <= start && start <= (isFinite(boundaryIdx) ? boundaryIdx : Number.MAX_SAFE_INTEGER)) {
+            const range = { startLineNumber: pos.lineNumber, startColumn: start, endLineNumber: pos.lineNumber, endColumn: end } as any;
+            editor.executeEdits('fe-clear-ph', [{ range, text: '' }]);
+            return;
+          }
+        }
+      });
+    } catch {}
 
     // 内联高亮：将 [表].@字段、[表]、@字段 应用不同的装饰样式
     const highlightEditorTokens = () => {
@@ -450,7 +539,8 @@ export default function FormulaEditorDemo() {
   const validateFormula = () => {
     const code = (editorFormula || "").trim();
     const transformed = transformToFieldKeys(code);
-    console.log(transformed);
+    const noSpaces = transformed.replace(/ +/g, "");
+    console.log(noSpaces);
   };
 
   const FORMULA_TEMPLATES: Record<string, string> = {
@@ -519,6 +609,8 @@ export default function FormulaEditorDemo() {
 
   // 插入文本：将字符串写入当前选区并聚焦编辑器
   const insertTextToEditor = (text: string) => {
+    suppressFilterOnceRef.current = true;
+    suppressFilterUntilRef.current = Date.now() + 300;
     if (!editorRef.current) return;
     const editor = editorRef.current;
     const sel = editor.getSelection();
@@ -530,6 +622,8 @@ export default function FormulaEditorDemo() {
   // 采纳示例：将右侧生成的公式写入编辑器
   const insertFormulaToEditor = () => {
     if (!generatedFormula) return;
+    suppressFilterOnceRef.current = true;
+    suppressFilterUntilRef.current = Date.now() + 2000;
     insertTextToEditor(generatedFormula);
   };
 
@@ -546,6 +640,8 @@ export default function FormulaEditorDemo() {
 
   // 插入函数：与最近选择的字段联动，避免重复的 '.'，并将光标定位到括号内
   const insertFunctionToEditor = (name: string) => {
+    suppressFilterOnceRef.current = true;
+    suppressFilterUntilRef.current = Date.now() + 2000;
     const fn = FUNCTIONS.find((f) => f.name === name);
     let params = fn?.params || "";
     if (params.startsWith("...")) params = "";
@@ -580,6 +676,8 @@ export default function FormulaEditorDemo() {
     const caretInsideParen = Math.max(0, snippet.indexOf('(') + 1);
     insertAtCursor(snippet, caretInsideParen);
     setSelectedFunction(method);
+    setFieldListHidden(false);
+    setTableListHidden(false);
   };
 
   // 插入字段：在参数上下文中智能补逗号；若左侧已有 [表]. 或 [表] 前缀则直接拼接
@@ -587,6 +685,10 @@ export default function FormulaEditorDemo() {
     // 旧参数：字段标识 name
     // 新参数：显示名 displayName
     setLastSelectedField({ field: displayName, displayName });
+    suppressFilterOnceRef.current = true;
+    suppressFilterUntilRef.current = Date.now() + 2000;
+    setFieldFilterKey("");
+    setTableFilterKey("");
     // 旧逻辑：在未选择数据表时也带出数据表前缀
     // const effectiveTable = lookupTable || (schema[0]?.name || "");
     // const prefix = effectiveTable ? `[${effectiveTable}].` : "";
@@ -610,7 +712,7 @@ export default function FormulaEditorDemo() {
         if (mFieldToken && typeof mFieldToken[1] === 'string') {
           const tok = '@' + String(mFieldToken[1]);
           startColumn = (pos.column || 1) - tok.length;
-          const range = { startLineNumber: pos.lineNumber, startColumn, endLineNumber: pos.lineNumber, endColumn: (pos.column || 1) };
+          const range = { startLineNumber: pos.lineNumber, startColumn, endLineNumber: pos.lineNumber, endColumn: startColumn + tok.length };
           editor.executeEdits('fe-field', [{ range, text: '' }]);
           cleared = true;
         } else {
@@ -618,13 +720,37 @@ export default function FormulaEditorDemo() {
           if (mPlain && mPlain[0]) {
             const tok = String(mPlain[0]);
             startColumn = (pos.column || 1) - tok.length;
-            const range = { startLineNumber: pos.lineNumber, startColumn, endLineNumber: pos.lineNumber, endColumn: (pos.column || 1) };
+            const range = { startLineNumber: pos.lineNumber, startColumn, endLineNumber: pos.lineNumber, endColumn: startColumn + tok.length };
             editor.executeEdits('fe-field', [{ range, text: '' }]);
             cleared = true;
           }
         }
         let token = "";
         let needComma = insideArgs && prevChar !== '(' && prevChar !== ',';
+        // 若左侧已存在 [表].@已有字段 的尾部结构，且表名与当前选中表一致：
+        // - 同字段重复点击：不再追加，直接将光标定位到尾部
+        // - 不同字段：仅替换 @字段 部分，避免重复 [表]. 前缀
+        const tailPair = left.match(/\[\s*([^\]]+)\s*\]\s*\.\s*@([^\s\.,\)\]]+)$/);
+        if (tailPair) {
+          const tableInTail = String(tailPair[1]);
+          const fieldInTail = String(tailPair[2]);
+          if (tableInTail === lookupTable) {
+            const search = '@' + fieldInTail;
+            const g2StartIdx = left.lastIndexOf(search);
+            if (g2StartIdx >= 0) {
+              const startCol2 = g2StartIdx + 1; // 列号（1-based）
+              const range2 = { startLineNumber: pos.lineNumber, startColumn: startCol2, endLineNumber: pos.lineNumber, endColumn: startCol2 + search.length };
+              const newText = '@' + displayName;
+              if (fieldInTail === displayName) {
+                try { editor.setPosition({ lineNumber: pos.lineNumber, column: startCol2 + newText.length }); editor.focus(); } catch {}
+                return;
+              }
+              editor.executeEdits('fe-field', [{ range: range2, text: newText }]);
+              try { editor.setPosition({ lineNumber: pos.lineNumber, column: startCol2 + newText.length }); editor.focus(); } catch {}
+              return;
+            }
+          }
+        }
         if (lookupTable) {
           const hasPrefixDot = trimmedLeft.endsWith(`[${lookupTable}].`);
           const hasPrefixNoDot = trimmedLeft.endsWith(`[${lookupTable}]`);
@@ -644,6 +770,10 @@ export default function FormulaEditorDemo() {
         if (cleared) {
           const rangeInsert = { startLineNumber: pos.lineNumber, startColumn, endLineNumber: pos.lineNumber, endColumn: startColumn };
           editor.executeEdits('fe-field', [{ range: rangeInsert, text: toInsert }]);
+          try {
+            editor.setPosition({ lineNumber: pos.lineNumber, column: startColumn + toInsert.length });
+            editor.focus();
+          } catch {}
         } else {
           insertAtCursor(toInsert);
         }
@@ -658,11 +788,30 @@ export default function FormulaEditorDemo() {
     setSelectedFunction('FILTER');
     setActiveTab('edit');
     setFilterFnKeyword('');
+    try {
+      const ed = editorRef.current;
+      const pos = ed?.getPosition();
+      const model = ed?.getModel();
+      const left = (model?.getLineContent(pos?.lineNumber || 1) || "").slice(0, Math.max(0, ((pos?.column || 1) - 1)));
+      const insideArgsNow = ((left.match(/\(/g) || []).length) > ((left.match(/\)/g) || []).length);
+      setFieldListHidden(true);
+      setTableListHidden(true);
+      if (insideArgsNow) {
+        // 等用户输入逗号后再通过 onEditorChange 展示列表
+      }
+    } catch {
+      setFieldListHidden(true);
+      setTableListHidden(true);
+    }
   };
 
   // 选择数据表：插入 [表]. 前缀（不自动加逗号），并更新当前选中表
   const chooseTable = (name: string) => {
     try {
+      suppressFilterOnceRef.current = true;
+      suppressFilterUntilRef.current = Date.now() + 2000;
+      setTableFilterKey("");
+      setFieldFilterKey("");
       setLookupTable(name);
       const editor = editorRef.current;
       if (editor) {
@@ -687,8 +836,12 @@ export default function FormulaEditorDemo() {
           const kw = left.slice(idxOpen + 1);
           startColumn = idxOpen + 2; // 1-based 列 + 跳过 '['
           const range = { startLineNumber: pos.lineNumber, startColumn, endLineNumber: pos.lineNumber, endColumn: (pos.column || 1) };
-          const text = `${kw ? '' : ''}${prefix}`;
+          const text = `${prefix}`;
           editor.executeEdits('fe-table', [{ range, text }]);
+          try {
+            editor.setPosition({ lineNumber: pos.lineNumber, column: startColumn + text.length });
+            editor.focus();
+          } catch {}
           replaced = true;
         } else {
           const mTok = left.match(/([^\s\[\]\(\),\.]+)$/);
@@ -696,7 +849,14 @@ export default function FormulaEditorDemo() {
             const tok = String(mTok[0]);
             startColumn = (pos.column || 1) - tok.length;
             const range = { startLineNumber: pos.lineNumber, startColumn, endLineNumber: pos.lineNumber, endColumn: (pos.column || 1) };
-            editor.executeEdits('fe-table', [{ range, text: prefix }]);
+            // 如果左侧已是相同前缀则不重复插入
+            if (!already) {
+              editor.executeEdits('fe-table', [{ range, text: prefix }]);
+              try {
+                editor.setPosition({ lineNumber: pos.lineNumber, column: startColumn + prefix.length });
+                editor.focus();
+              } catch {}
+            }
             replaced = true;
           }
         }
@@ -707,6 +867,18 @@ export default function FormulaEditorDemo() {
       } else {
         insertAtCursor(`[${name}].`);
       }
+      try {
+        const ed = editorRef.current;
+        const pos2 = ed?.getPosition();
+        const model2 = ed?.getModel();
+        const left2 = (model2?.getLineContent(pos2?.lineNumber || 1) || "").slice(0, Math.max(0, ((pos2?.column || 1) - 1)));
+        const insideArgsNow2 = ((left2.match(/\(/g) || []).length) > ((left2.match(/\)/g) || []).length);
+        if (insideArgsNow2) {
+          // 在参数内选择表后，仍然保持隐藏，等待逗号触发显示
+          setFieldListHidden(true);
+          setTableListHidden(true);
+        }
+      } catch {}
     } catch {}
   };
 
@@ -743,7 +915,11 @@ export default function FormulaEditorDemo() {
     const raw = val || "";
     const v = raw.startsWith("=") ? raw.slice(1) : raw;
     setEditorFormula(v);
-    if (!v.trim()) setValidationError("");
+    if (!v.trim()) {
+      setValidationError("");
+      setFieldListHidden(false);
+      setTableListHidden(false);
+    }
     // 先做静态快速预览
     updatePreview(v);
     try {
@@ -779,23 +955,65 @@ export default function FormulaEditorDemo() {
               setLastSelectedField({ field: disp, displayName: disp });
               setSelectedFunction('FILTER');
             }
-            // 动态过滤关键字：编辑器中输入的表名/字段名用于侧栏过滤
-            const idxOpen = left.lastIndexOf('[');
-            const idxClose = left.lastIndexOf(']');
-            const afterAtCtx = /@[^.()\s,，\]]*$/.test(left) || trimmed.endsWith('@');
-            if (idxOpen > idxClose) {
-              const kw = left.slice(idxOpen + 1).trim();
-              setTableFilterKey(kw);
-            } else {
-              const lastTok = left.match(/([^\s\[\]\(\),\.]+)$/);
-              if (!afterAtCtx && lastTok && lastTok[1]) setTableFilterKey(String(lastTok[1]).trim());
-              else setTableFilterKey("");
+            const lastCh = left.slice(-1);
+            const isTypingChar = /[^\s\[\]\(\),，\.]/.test(lastCh) || lastCh === '@' || lastCh === '[';
+            const openCountAll = (left.match(/\(/g) || []).length;
+            const closeCountAll = (left.match(/\)/g) || []).length;
+            const insideArgsGlobal = openCountAll > closeCountAll;
+            const now = Date.now();
+            const suppressed = suppressFilterOnceRef.current || now < suppressFilterUntilRef.current;
+            if (!suppressed && isTypingChar) {
+              if (insideArgsGlobal) {
+                setTableFilterKey("");
+                setFieldFilterKey("");
+              } else {
+                const idxOpen = left.lastIndexOf('[');
+                const idxClose = left.lastIndexOf(']');
+                const afterAtCtx = /@[^.()\s,，\]]*$/.test(left) || trimmed.endsWith('@');
+                if (idxOpen > idxClose) {
+                  const kw = left.slice(idxOpen + 1).trim();
+                  setTableFilterKey(kw);
+                } else {
+                  setTableFilterKey("");
+                }
+                const mFieldPlain = left.match(/@([^.()\s,，\]]*)$/);
+                if (mFieldPlain && mFieldPlain[1]) {
+                  const disp = String(mFieldPlain[1]).trim();
+                  const exactField = getFieldsForTable(lookupTable).some((f) => (f.name || '').toLowerCase() === disp.toLowerCase());
+                  const hasPairExact = lookupTable ? trimmed.endsWith(`[${lookupTable}].@${disp}`) : false;
+                  const hasPlainExact = trimmed.endsWith(`@${disp}`);
+                  if (exactField && (hasPairExact || hasPlainExact)) {
+                    setFieldFilterKey("");
+                  } else {
+                    setFieldFilterKey(disp);
+                  }
+                } else {
+                  setFieldFilterKey("");
+                }
+              }
             }
-            const mFieldPlain = left.match(/@([^.()\s,，\]]*)$/) || left.match(/([^\s\[\]\(\),\.]+)$/);
-            if (mFieldPlain && mFieldPlain[1]) {
-              setFieldFilterKey(String(mFieldPlain[1]).trim());
-            } else {
-              setFieldFilterKey("");
+
+            if (insideArgsGlobal) {
+              const leftNoTrailWS = left.replace(/\s+$/, '');
+              const lastNs = leftNoTrailWS.slice(-1);
+              const col0 = (pos.column || 1) - 1;
+              const right = line.slice(Math.max(0, col0));
+              const idxOpen = left.lastIndexOf('(');
+              const idxCloseRel = right.indexOf(')');
+              const idxClose = idxCloseRel >= 0 ? col0 + idxCloseRel : -1;
+              const innerSeg = (idxOpen >= 0 && idxClose >= 0) ? line.slice(idxOpen + 1, idxClose) : '';
+              const innerHasContent = innerSeg.trim().length > 0;
+              if (lastNs === ',') {
+                keepArgPickerUntilRef.current = Date.now() + 1500;
+                setFieldListHidden(false);
+                setTableListHidden(false);
+              } else if (!innerHasContent) {
+                setFieldListHidden(false);
+                setTableListHidden(false);
+              } else {
+                setFieldListHidden(true);
+                setTableListHidden(true);
+              }
             }
           }
         } catch {}
@@ -806,10 +1024,15 @@ export default function FormulaEditorDemo() {
         const pos = editorRef.current.getPosition();
         const model = editorRef.current.getModel();
         const wordObj = model?.getWordUntilPosition(pos);
+        const left2 = (model?.getLineContent(pos.lineNumber) || "").slice(0, Math.max(0, (pos.column || 1) - 1));
+        const insideArgsNow = ((left2.match(/\(/g) || []).length) > ((left2.match(/\)/g) || []).length);
         const w = (wordObj?.word || "").toUpperCase();
-        setFilterFnKeyword(w);
+        const prevCh2 = left2.slice(-1);
+        const isWord = /^[A-Z_]+$/.test(w);
+        const shouldFnFilter = !insideArgsNow && isWord && /[\s=,(]/.test(prevCh2);
+        setFilterFnKeyword(shouldFnFilter ? w : "");
         let selName: string | null = null;
-        if (w) {
+        if (!insideArgsNow && w) {
           const exact = FUNCTIONS.find((f) => f.name === w);
           if (exact) selName = exact.name;
           else {
@@ -819,27 +1042,29 @@ export default function FormulaEditorDemo() {
             }
           }
         }
-        const line = model?.getLineContent(pos.lineNumber) || "";
-        const left = line.slice(0, Math.max(0, (pos.column || 1) - 1));
-        const openMatch = left.match(/([A-Za-z_]+)\s*\($/);
-        if (openMatch) {
-          const cand = openMatch[1].toUpperCase();
-          const exact = FUNCTIONS.find((f) => f.name === cand);
-          if (exact) selName = exact.name;
-        }
-        if (!selName && line) {
-          const matches = Array.from(line.matchAll(/([A-Za-z_]+)\s*\(/g));
-          if (matches.length) {
-            const near = matches.reduce((acc: any, m: any) => {
-              const start = m.index || 0;
-              const end = start + m[0].length;
-              if (end <= (pos.column || 1)) return m;
-              return acc;
-            }, null);
-            const c2 = near && near[1] ? String(near[1]).toUpperCase() : "";
-            if (c2) {
-              const ex2 = FUNCTIONS.find((f) => f.name === c2);
-              if (ex2) selName = ex2.name;
+        if (!insideArgsNow) {
+          const line = model?.getLineContent(pos.lineNumber) || "";
+          const left = line.slice(0, Math.max(0, (pos.column || 1) - 1));
+          const openMatch = left.match(/([A-Za-z_]+)\s*\($/);
+          if (openMatch) {
+            const cand = openMatch[1].toUpperCase();
+            const exact = FUNCTIONS.find((f) => f.name === cand);
+            if (exact) selName = exact.name;
+          }
+          if (!selName && line) {
+            const matches = Array.from(line.matchAll(/([A-Za-z_]+)\s*\(/g));
+            if (matches.length) {
+              const near = matches.reduce((acc: any, m: any) => {
+                const start = m.index || 0;
+                const end = start + m[0].length;
+                if (end <= (pos.column || 1)) return m;
+                return acc;
+              }, null);
+              const c2 = near && near[1] ? String(near[1]).toUpperCase() : "";
+              if (c2) {
+                const ex2 = FUNCTIONS.find((f) => f.name === c2);
+                if (ex2) selName = ex2.name;
+              }
             }
           }
         }
@@ -849,6 +1074,14 @@ export default function FormulaEditorDemo() {
     } catch {}
     // 关键：进行严格 parse 校验并设置 Monaco markers & preview
     validateAndPreview(v);
+    if (suppressFilterOnceRef.current) suppressFilterOnceRef.current = false;
+    try {
+      const ed2 = editorRef.current;
+      const model2 = ed2?.getModel();
+      const pos2 = ed2?.getPosition();
+      const leftSnap = (model2?.getLineContent(pos2?.lineNumber || 1) || "").slice(0, Math.max(0, ((pos2?.column || 1) - 1)));
+      prevLeftRef.current = leftSnap;
+    } catch {}
   };
 
   // 光标插入：在当前光标写入文本，并支持将光标移动到括号内部
@@ -871,6 +1104,11 @@ export default function FormulaEditorDemo() {
     if (!kw) return FUNCTION_GROUPS;
     return FUNCTION_GROUPS.map((g) => ({ category: g.category, items: g.items.filter((n) => n.toUpperCase().startsWith(kw)) })).filter((g) => g.items.length > 0);
   };
+
+  const filteredFields = getFieldsForTable(lookupTable)
+    .filter((f) => !fieldFilterKey || ((f.name || '').toLowerCase().includes(fieldFilterKey.toLowerCase())));
+  const filteredTables = schema
+    .filter((t) => !tableFilterKey || t.name.toLowerCase().includes(tableFilterKey.toLowerCase()));
 
   return (
     <div className="fe-page">
@@ -911,31 +1149,30 @@ export default function FormulaEditorDemo() {
             <div className="fe-function-grid">
               <div className="fe-function-sidebar">
                 <div className="fe-function-content">
-                  <div className="fe-group">
-                    <div className="fe-hint fe-mb6">字段引用</div>
-                    <div className="fe-function-list">
-                      {getFieldsForTable(lookupTable)
-                        .filter((f) => !fieldFilterKey || ((f.name || '').toLowerCase().includes(fieldFilterKey.toLowerCase())))
-                        .map((f) => (
+                  {!fieldListHidden && (
+                    <div className="fe-group">
+                      {filteredFields.length > 0 && <div className="fe-hint fe-mb6">字段引用</div>}
+                      <div className="fe-function-list">
+                        {filteredFields.map((f) => (
                           <button key={f.field} onClick={() => insertCurrentField(f.name)} className="fe-function-item">
                             @{f.name}
                           </button>
                         ))}
+                      </div>
                     </div>
-                  </div>
-                  <div className="fe-group">
-                    <div className="fe-hint fe-mb6">整表引用</div>
-                    <div className="fe-function-list">
-                        {!tableListHidden &&
-                          schema
-                            .filter((t) => !tableFilterKey || t.name.toLowerCase().includes(tableFilterKey.toLowerCase()))
-                            .map((t) => (
-                              <button key={t.name} onClick={() => chooseTable(t.name)} className={`fe-function-item ${lookupTable === t.name ? "active" : ""}`}>
-                                {t.name}
-                              </button>
-                            ))}
+                  )}
+                  {!tableListHidden && (
+                    <div className="fe-group">
+                      {filteredTables.length > 0 && <div className="fe-hint fe-mb6">整表引用</div>}
+                      <div className="fe-function-list">
+                          {filteredTables.map((t) => (
+                            <button key={t.name} onClick={() => chooseTable(t.name)} className={`fe-function-item ${lookupTable === t.name ? "active" : ""}`}>
+                              {t.name}
+                            </button>
+                          ))}
+                      </div>
                     </div>
-                  </div>
+                  )}
                   <div className="fe-group">
                     {getFilteredGroups().map((group) => (
                       <div key={group.category} className="fe-group">
